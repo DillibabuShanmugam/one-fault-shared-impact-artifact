@@ -1,0 +1,310 @@
+diff --git a/sim/simx/execute.cpp b/sim/simx/execute.cpp
+index 3829260..09ee7d9 100644
+--- a/sim/simx/execute.cpp
++++ b/sim/simx/execute.cpp
+@@ -33,6 +33,29 @@
+ 
+ using namespace vortex;
+ 
++// =====================================================================
++// Architectural Fault Injection (Vortex SimX)
++// Injects bit-flips on register writeback at a specified instruction count.
++// Scoped per warp/thread (SIMT-aware).
++// =====================================================================
++namespace vx_fi {
++  // Fault descriptor (set by main.cpp before processor.run())
++  bool     enabled       = false;
++  uint64_t target_instr  = 0;        // global instruction count to fault
++  int32_t  target_warp   = -1;       // -1 = any warp
++  int32_t  target_thread = -1;       // -1 = any thread in warp
++  uint32_t fault_mask    = 0;        // XOR mask applied to writeback value
++  int32_t  target_rd     = -1;       // -1 = any rd; else specific register index
++
++  // Runtime counter (incremented on every retired writeback)
++  uint64_t instr_counter = 0;
++  bool     fault_done    = false;    // ensures fault injected exactly once
++
++  // Logging
++  bool     verbose       = false;
++}
++// =====================================================================
++
+ inline uint64_t nan_box(uint32_t value) {
+   return value | 0xffffffff00000000;
+ }
+@@ -1476,15 +1499,52 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
+     case RegType::Integer:
+       if (rdest.idx != 0) {
+         DPH(2, "Dest Reg: " << rdest << "={");
++        // === ARCHITECTURAL FAULT INJECTION (per-warp-instruction) ===
++        // Increment counter ONCE per dynamic warp instruction (not per lane)
++        // so the descriptor's target_instr identifies an entire SIMT
++        // instruction and faults can fire across ALL active matching lanes
++        // of that single instruction. This models a shared-resource fault
++        // (e.g. a writeback-bus glitch) that affects every lane currently
++        // committing through the integer write-back stage.
++        uint64_t this_winstr = vx_fi::instr_counter++;
++        const bool fi_match_winstr =
++            vx_fi::enabled
++            && !vx_fi::fault_done
++            && this_winstr == vx_fi::target_instr
++            && (vx_fi::target_warp == -1 || (int32_t)wid == vx_fi::target_warp)
++            && (vx_fi::target_rd   == -1 || (int32_t)rdest.idx == vx_fi::target_rd);
++        bool any_lane_faulted = false;
+         for (uint32_t t = 0; t < num_threads; ++t) {
+           if (t) DPN(2, ", ");
+           if (!warp.tmask.test(t)) {
+             DPN(2, "-");
+             continue;
+           }
+-          warp.ireg_file.at(rdest.idx).at(t) = rd_data[t].i;
+-          DPN(2, "0x" << std::hex << rd_data[t].u << std::dec);
++          WordI fault_value = rd_data[t].i;
++          // Fire on every matching lane within this warp instruction.
++          if (fi_match_winstr
++              && (vx_fi::target_thread == -1
++                  || (int32_t)t == vx_fi::target_thread))
++          {
++            WordI corrupted = fault_value ^ (WordI)vx_fi::fault_mask;
++            if (vx_fi::verbose) {
++              std::cerr << "[FI] winstr#" << this_winstr
++                        << " wid=" << wid << " tid=" << t
++                        << " rd=x" << rdest.idx
++                        << " orig=0x" << std::hex << (uint64_t)fault_value
++                        << " mask=0x" << vx_fi::fault_mask
++                        << " new=0x" << (uint64_t)corrupted
++                        << std::dec << std::endl;
++            }
++            fault_value = corrupted;
++            any_lane_faulted = true;
++          }
++          warp.ireg_file.at(rdest.idx).at(t) = fault_value;
++          DPN(2, "0x" << std::hex << (uint64_t)fault_value << std::dec);
+         }
++        // Latch ONCE after the entire warp instruction, so subsequent
++        // warp instructions are not perturbed.
++        if (any_lane_faulted) vx_fi::fault_done = true;
+         DPN(2, "}" << std::endl);
+       } else {
+         // disable writes to x0
+diff --git a/sim/simx/main.cpp b/sim/simx/main.cpp
+index cd79dc5..2742815 100644
+--- a/sim/simx/main.cpp
++++ b/sim/simx/main.cpp
+@@ -29,7 +29,9 @@
+ using namespace vortex;
+ 
+ static void show_usage() {
+-   std::cout << "Usage: [-c <cores>] [-w <warps>] [-t <threads>] [-v: vector-test] [-s: stats] [-h: help] <program>" << std::endl;
++   std::cout << "Usage: [-c <cores>] [-w <warps>] [-t <threads>] [-v: vector-test] [-s: stats]" << std::endl
++             << "       [-r <round>] [-b <byte>] [-x <xor_value>] [-W <warp>] [-T <thread>]" << std::endl
++             << "       [-K <hex_key>] [-P <hex_pt>] [-h: help] <program>" << std::endl;
+ }
+ 
+ uint32_t num_threads = NUM_THREADS;
+@@ -39,9 +41,43 @@ bool showStats = false;
+ bool vector_test = false;
+ const char* program = nullptr;
+ 
++// Fault injection parameters (DFA support)
++uint32_t fault_round  = 0;       // 0 = no fault, 1-10 = AES round (memory-mapped path)
++uint32_t fault_byte   = 0;       // 0-15
++uint32_t fault_value  = 0;       // XOR mask
++uint32_t fault_warp   = 0xFFFFFFFFu;
++uint32_t fault_thread = 0xFFFFFFFFu;
++const char* hex_key = nullptr;   // 32 hex chars = 16 bytes
++const char* hex_pt  = nullptr;
++
++// Architectural fault injection (NEW: in execute pipeline)
++namespace vx_fi {
++  extern bool     enabled;
++  extern uint64_t target_instr;
++  extern int32_t  target_warp;
++  extern int32_t  target_thread;
++  extern uint32_t fault_mask;
++  extern int32_t  target_rd;
++  extern bool     verbose;
++  extern uint64_t instr_counter;
++  extern bool     fault_done;
++}
++int64_t arch_fi_instr = -1;       // -1 = disabled
++int32_t arch_fi_rd    = -1;
++bool    arch_fi_verbose = false;
++bool    simt_readback = false;    // SIMT layout: 4 PTs + key + 4 CTs at result_buf
++
++// Memory addresses for the legacy single-lane simx_aes/aes.bin build.
++// Multi-lane SIMT builds (aes_simt.bin via libvortex.a) place result_buf
++// at a runtime-determined address; the host may override with -A.
++static const uint32_t FAULT_CTRL_ADDR_DEFAULT = 0x8001E000;
++static const uint32_t RESULT_BUF_ADDR_DEFAULT = 0x8001F000;
++static uint32_t FAULT_CTRL_ADDR = FAULT_CTRL_ADDR_DEFAULT;
++static uint32_t RESULT_BUF_ADDR = RESULT_BUF_ADDR_DEFAULT;
++
+ static void parse_args(int argc, char **argv) {
+   	int c;
+-  	while ((c = getopt(argc, argv, "t:w:c:vsh")) != -1) {
++  	while ((c = getopt(argc, argv, "t:w:c:vsr:b:x:W:T:K:P:i:R:VSA:h")) != -1) {
+     	switch (c) {
+       case 't':
+         num_threads = atoi(optarg);
+@@ -58,6 +94,18 @@ static void parse_args(int argc, char **argv) {
+       case 's':
+         showStats = true;
+         break;
++      case 'r': fault_round  = atoi(optarg); break;
++      case 'b': fault_byte   = atoi(optarg); break;
++      case 'x': fault_value  = (uint32_t)strtoul(optarg, nullptr, 0); break;
++      case 'W': fault_warp   = atoi(optarg); break;
++      case 'T': fault_thread = atoi(optarg); break;
++      case 'K': hex_key = optarg; break;
++      case 'P': hex_pt  = optarg; break;
++      case 'i': arch_fi_instr   = strtoll(optarg, nullptr, 0); break;
++      case 'R': arch_fi_rd      = atoi(optarg); break;
++      case 'V': arch_fi_verbose = true; break;
++      case 'S': simt_readback   = true; break;
++      case 'A': RESULT_BUF_ADDR = (uint32_t)strtoul(optarg, nullptr, 0); break;
+     	case 'h':
+       	show_usage();
+       	exit(0);
+@@ -115,9 +163,69 @@ int main(int argc, char **argv) {
+         return -1;
+       }
+     }
++
++    // === DFA Fault Injection: write fault control to memory before execution ===
++    if (fault_round > 0) {
++      uint32_t fctrl[8] = {fault_round, fault_byte, fault_value,
++                            fault_warp, fault_thread, 0, 0, 0};
++      for (int i = 0; i < 8; ++i) {
++        ram.write(&fctrl[i], FAULT_CTRL_ADDR + i*4, 4);
++      }
++      std::cerr << "[FAULT] Injecting at round=" << fault_round
++                << " byte=" << fault_byte
++                << " xor=0x" << std::hex << fault_value << std::dec
++                << " warp=" << (fault_warp == 0xFFFFFFFFu ? -1 : (int)fault_warp)
++                << " thread=" << (fault_thread == 0xFFFFFFFFu ? -1 : (int)fault_thread)
++                << std::endl;
++    }
++
++    // === Optional plaintext/key override ===
++    auto hex_to_bytes = [](const char *hex, uint8_t *out, int n) {
++      for (int i = 0; i < n; ++i) {
++        unsigned v;
++        sscanf(hex + i*2, "%02x", &v);
++        out[i] = (uint8_t)v;
++      }
++    };
++    if (hex_pt) {
++      uint8_t pt[16] = {0};
++      hex_to_bytes(hex_pt, pt, 16);
++      for (int i = 0; i < 16; ++i) {
++        uint8_t b = pt[i];
++        ram.write(&b, RESULT_BUF_ADDR + i, 1);
++      }
++    }
++    if (hex_key) {
++      uint8_t key[16] = {0};
++      hex_to_bytes(hex_key, key, 16);
++      for (int i = 0; i < 16; ++i) {
++        uint8_t b = key[i];
++        ram.write(&b, RESULT_BUF_ADDR + 16 + i, 1);
++      }
++    }
++
+   #ifndef NDEBUG
+     std::cout << "[VXDRV] START: program=" << program << std::endl;
+   #endif
++
++    // === Architectural fault injection (in execute pipeline) ===
++    if (arch_fi_instr >= 0) {
++      vx_fi::enabled       = true;
++      vx_fi::target_instr  = (uint64_t)arch_fi_instr;
++      vx_fi::target_warp   = (fault_warp   == 0xFFFFFFFFu) ? -1 : (int32_t)fault_warp;
++      vx_fi::target_thread = (fault_thread == 0xFFFFFFFFu) ? -1 : (int32_t)fault_thread;
++      vx_fi::fault_mask    = fault_value;
++      vx_fi::target_rd     = arch_fi_rd;
++      vx_fi::verbose       = arch_fi_verbose;
++      vx_fi::instr_counter = 0;
++      vx_fi::fault_done    = false;
++      std::cerr << "[ARCH-FI] enabled: instr=" << arch_fi_instr
++                << " mask=0x" << std::hex << fault_value << std::dec
++                << " warp=" << vx_fi::target_warp
++                << " thread=" << vx_fi::target_thread
++                << " rd=" << vx_fi::target_rd << std::endl;
++    }
++
+     // run simulation
+   #ifdef EXT_V_ENABLE
+     // vector test exitcode is a special case
+@@ -126,6 +234,71 @@ int main(int argc, char **argv) {
+     // else continue as normal
+     processor.run();
+ 
++    if (arch_fi_instr >= 0) {
++      std::cerr << "[ARCH-FI] total instrs executed=" << vx_fi::instr_counter
++                << " fault_done=" << (vx_fi::fault_done ? "yes" : "no") << std::endl;
++    }
++
++    // === DFA: read result buffer ===
++    if (simt_readback) {
++      // Debug: dump per-lane scratch (placed in BSS by linker) and lane_done
++      uint8_t lane_done_bytes[4] = {0};
++      for (int i = 0; i < 4; ++i) ram.read(&lane_done_bytes[i], 0x8001D000 + i, 1);
++      std::cout << "LANE_DONE=" << (int)lane_done_bytes[0]
++                << "," << (int)lane_done_bytes[1]
++                << "," << (int)lane_done_bytes[2]
++                << "," << (int)lane_done_bytes[3] << std::endl;
++      // SIMT batched layout (aes_simt.c):
++      //   [  0..  63] = 4 plaintexts (16 bytes each)
++      //   [ 64..  79] = shared key
++      //   [ 80.. 143] = 4 ciphertexts
++      //   [144]       = done flag
++      //   [145]       = num lanes that finished
++      uint8_t result[256] = {0};
++      for (int i = 0; i < 256; ++i) ram.read(&result[i], RESULT_BUF_ADDR + i, 1);
++      for (int lane = 0; lane < 4; ++lane) {
++        std::cout << "PT" << lane << "=";
++        for (int i = 0; i < 16; ++i) printf("%02x", result[lane*16 + i]);
++        std::cout << std::endl;
++      }
++      std::cout << "KEY=";
++      for (int i = 0; i < 16; ++i) printf("%02x", result[64+i]);
++      std::cout << std::endl;
++      for (int lane = 0; lane < 4; ++lane) {
++        std::cout << "CT" << lane << "=";
++        for (int i = 0; i < 16; ++i) printf("%02x", result[80 + lane*16 + i]);
++        std::cout << std::endl;
++      }
++      std::cout << "DONE=" << (int)result[144]
++                << " LANES=" << (int)result[145] << std::endl;
++      // sentinels:
++      std::cout << "PRE_CT_SENTINEL=";
++      for (int i = 200; i < 204; ++i) printf("%02x ", result[i]);
++      std::cout << std::endl;
++      std::cout << "POST_CT_SENTINEL=";
++      for (int i = 210; i < 214; ++i) printf("%02x ", result[i]);
++      std::cout << std::endl;
++      // Full dump 0..255 to spot writes that landed elsewhere
++      std::cout << "FULL_RESULT_BUF=";
++      for (int i = 0; i < 256; ++i) {
++        if (i % 16 == 0) printf("\n  [%3d] ", i);
++        printf("%02x ", result[i]);
++      }
++      std::cout << std::endl;
++    } else {
++      uint8_t result[64] = {0};
++      for (int i = 0; i < 64; ++i) {
++        ram.read(&result[i], RESULT_BUF_ADDR + i, 1);
++      }
++      std::cout << "PT="; for (int i = 0; i < 16; ++i) printf("%02x", result[i]);
++      std::cout << std::endl;
++      std::cout << "KEY="; for (int i = 0; i < 16; ++i) printf("%02x", result[16+i]);
++      std::cout << std::endl;
++      std::cout << "CT="; for (int i = 0; i < 16; ++i) printf("%02x", result[32+i]);
++      std::cout << std::endl;
++      std::cout << "DONE=" << (int)result[48] << std::endl;
++    }
++
+     // read exitcode from @MPM.1
+     ram.read(&exitcode, (IO_MPM_ADDR + 8), 4);
+   }

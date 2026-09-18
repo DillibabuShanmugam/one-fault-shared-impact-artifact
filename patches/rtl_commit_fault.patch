@@ -1,0 +1,124 @@
+diff --git a/hw/rtl/core/VX_commit.sv b/hw/rtl/core/VX_commit.sv
+index d54da6a..8940814 100644
+--- a/hw/rtl/core/VX_commit.sv
++++ b/hw/rtl/core/VX_commit.sv
+@@ -158,6 +158,67 @@ module VX_commit import VX_gpu_pkg::*; #(
+         .data_out ({commit_sched_if.committed_warps})
+     );
+ 
++    // ============================================================
++    // Commit-stage single-fault injection (SIMT write-back hook).
++    // Mirrors the SimX IRF write-back fault primitive. Gated by
++    // simulator plusargs; with fi_enable=0 the write-back path is a
++    // bit-identical pass-through of commit_arb_if[i].data.data.
++    // Fires exactly once: XORs FI_MASK into the committed register
++    // data of EVERY active (tmask=1) lane of the targeted warp's
++    // targeted retiring write-back. Targets issue slot 0 (ISSUE_WIDTH==1).
++    // ============================================================
++    /* verilator lint_off UNUSEDSIGNAL */
++    /* verilator lint_off WIDTHTRUNC */
++    reg         fi_enable;
++    reg  [31:0] fi_warp;
++    reg  [31:0] fi_instr;
++    reg  [31:0] fi_mask;
++    reg  [31:0] fi_count;
++    reg         fi_done;
++    initial begin
++        fi_enable = 0; fi_warp = 0; fi_instr = 0; fi_mask = 0;
++        void'($value$plusargs("fi_enable=%d", fi_enable));
++        void'($value$plusargs("fi_warp=%d",   fi_warp));
++        void'($value$plusargs("fi_instr=%d",  fi_instr));
++        void'($value$plusargs("fi_mask=%h",   fi_mask));
++    end
++    wire fi_wb_fire = per_issue_commit_fire[0]
++                    && commit_arb_if[0].data.wb
++                    && per_issue_commit_eop[0]
++                    && (commit_arb_if[0].data.wid == NW_WIDTH'(fi_warp));
++    wire fi_fire = fi_enable && !fi_done && fi_wb_fire && (fi_count == fi_instr);
++    /* verilator lint_on WIDTHTRUNC */
++    /* verilator lint_on UNUSEDSIGNAL */
++    always @(posedge clk) begin
++        if (reset) begin
++            fi_count <= '0;
++            fi_done  <= 1'b0;
++        end else if (fi_enable && fi_wb_fire && !fi_done) begin
++            fi_count <= fi_count + 1;
++            if (fi_fire) begin
++                fi_done <= 1'b1;
++                $display("[FI] INJECT wid=%0d instr=%0d rd=%0d tmask=%b mask=0x%08h",
++                         commit_arb_if[0].data.wid, fi_count, commit_arb_if[0].data.rd,
++                         commit_arb_if[0].data.tmask, fi_mask);
++                for (int t = 0; t < `SIMD_WIDTH; t++) begin
++                    if (commit_arb_if[0].data.tmask[t])
++                        $display("[FI]   lane %0d ACTIVE  0x%08h -> 0x%08h", t,
++                                 commit_arb_if[0].data.data[t],
++                                 commit_arb_if[0].data.data[t] ^ fi_mask);
++                    else
++                        $display("[FI]   lane %0d INACTIVE (unchanged)", t);
++                end
++            end else begin
++                $write("[FI] pass  wid=%0d instr=%0d rd=%0d tmask=%b data=",
++                       commit_arb_if[0].data.wid, fi_count, commit_arb_if[0].data.rd,
++                       commit_arb_if[0].data.tmask);
++                for (int t = 0; t < `SIMD_WIDTH; t++)
++                    $write(" [%0d]=0x%08h", t, commit_arb_if[0].data.data[t]);
++                $write("\n");
++            end
++        end
++    end
++
+     // Writeback
+ 
+     for (genvar i = 0; i < `ISSUE_WIDTH; ++i) begin : g_writeback
+@@ -168,7 +229,10 @@ module VX_commit import VX_gpu_pkg::*; #(
+         assign writeback_if[i].data.PC   = commit_arb_if[i].data.PC;
+         assign writeback_if[i].data.tmask= commit_arb_if[i].data.tmask;
+         assign writeback_if[i].data.rd   = commit_arb_if[i].data.rd;
+-        assign writeback_if[i].data.data = commit_arb_if[i].data.data;
++        for (genvar t = 0; t < `SIMD_WIDTH; ++t) begin : g_fi_data
++            assign writeback_if[i].data.data[t] = commit_arb_if[i].data.data[t]
++                ^ (((i == 0) && fi_fire && commit_arb_if[i].data.tmask[t]) ? `XLEN'(fi_mask) : `XLEN'(0));
++        end
+         assign writeback_if[i].data.sop  = commit_arb_if[i].data.sop;
+         assign writeback_if[i].data.eop  = commit_arb_if[i].data.eop;
+         assign commit_arb_if[i].ready    = 1;
+diff --git a/sim/rtlsim/main.cpp b/sim/rtlsim/main.cpp
+index dc8b479..14dcd89 100644
+--- a/sim/rtlsim/main.cpp
++++ b/sim/rtlsim/main.cpp
+@@ -19,6 +19,7 @@
+ #include <mem.h>
+ #include <VX_config.h>
+ #include <VX_types.h>
++#include <verilated.h>
+ #include "processor.h"
+ 
+ #define RAM_PAGE_SIZE 4096
+@@ -58,6 +59,9 @@ int main(int argc, char **argv) {
+ 
+ 	parse_args(argc, argv);
+ 
++	// forward all command-line args (incl. +fi_* plusargs) to the Verilated model
++	Verilated::commandArgs(argc, argv);
++
+ 	// create memory module
+ 	vortex::RAM ram(0, RAM_PAGE_SIZE);
+ 
+@@ -96,5 +100,17 @@ int main(int argc, char **argv) {
+ 	// read exitcode from @MPM.1
+   ram.read(&exitcode, (IO_MPM_ADDR + 8), 4);
+ 
++	// dump per-lane RESULT buffer (0x8001F000) for fault-injection experiments
++	{
++		uint32_t res[4] = {0,0,0,0};
++		for (int i = 0; i < 4; ++i)
++			ram.read(&res[i], 0x8001F000ull + 4*i, 4);
++		std::cout << "[RESULT] ";
++		for (int i = 0; i < 4; ++i)
++			std::cout << "lane" << i << "=0x" << std::hex << std::setw(8)
++			          << std::setfill('0') << res[i] << " ";
++		std::cout << std::dec << std::endl;
++	}
++
+ 	return exitcode;
+ }

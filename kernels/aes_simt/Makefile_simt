@@ -1,0 +1,57 @@
+# Build the SIMT AES-128 kernel (aes_simt.bin) with LLVM-Vortex and the Vortex kernel runtime
+# Authors: Dillibabu Shanmugam and Patrick Schaumont
+# Affiliation: Worcester Polytechnic Institute
+VORTEX_HOME ?= $(realpath ../vortex)
+ROOT_DIR    := $(VORTEX_HOME)
+LLVM_VORTEX ?= $(HOME)/tools/llvm-vortex
+RISCV       ?= $(HOME)/tools/riscv32-gnu-toolchain
+LIBC_VORTEX ?= $(HOME)/tools/libc32
+LIBCRT_VORTEX ?= $(HOME)/tools/libcrt32
+RISCV_SYSROOT := $(RISCV)/riscv32-unknown-elf
+RISCV_TOOLCHAIN_PATH := $(RISCV)
+XLEN := 32
+STARTUP_ADDR ?= 0x80000000
+
+PROJECT := aes_simt
+SRCS    := aes_simt.c
+
+LLVM_CFLAGS := --sysroot=$(RISCV_SYSROOT)
+LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH)
+LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex
+LLVM_CFLAGS += -mllvm -vortex-branch-divergence=0
+
+CC  := $(LLVM_VORTEX)/bin/clang $(LLVM_CFLAGS)
+DP  := $(LLVM_VORTEX)/bin/llvm-objdump
+CP  := $(LLVM_VORTEX)/bin/llvm-objcopy
+
+CFLAGS := -O2 -mcmodel=medany -fno-exceptions -nostartfiles -nostdlib \
+          -fdata-sections -ffunction-sections \
+          -march=rv32imaf -mabi=ilp32f \
+          -I$(VORTEX_HOME)/kernel/include -I$(VORTEX_HOME)/hw \
+          -DXLEN_$(XLEN) -DNDEBUG
+
+LIBC_LIB := -L$(LIBC_VORTEX)/lib -lm -lc
+LIBC_LIB += $(LIBCRT_VORTEX)/lib/baremetal/libclang_rt.builtins-riscv$(XLEN).a
+
+VORTEX_KN_PATH := $(VORTEX_HOME)/build/kernel
+LDFLAGS := -Wl,-Bstatic,--gc-sections,-T,link_simt.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) \
+           $(VORTEX_KN_PATH)/libvortex.a $(LIBC_LIB)
+
+SIMX := $(VORTEX_HOME)/build/sim/simx/simx
+
+all: $(PROJECT).bin $(PROJECT).dump
+
+$(PROJECT).elf: $(SRCS) link_simt.ld
+	$(CC) $(CFLAGS) $(SRCS) $(LDFLAGS) -o $@
+
+$(PROJECT).bin: $(PROJECT).elf
+	$(CP) -O binary $< $@
+
+$(PROJECT).dump: $(PROJECT).elf
+	$(DP) -D $< > $@
+
+run: $(PROJECT).bin
+	$(SIMX) $(PROJECT).bin
+
+clean:
+	rm -f $(PROJECT).elf $(PROJECT).bin $(PROJECT).dump

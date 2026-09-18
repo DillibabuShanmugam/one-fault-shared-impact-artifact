@@ -1,0 +1,19 @@
+
+amp_kernel.elf:     file format elf32-littleriscv
+
+
+Disassembly of section .text.init:
+
+80000000 <_start>:
+80000000:	00f00593          	li	a1,15
+80000004:	0005800b          	.4byte	0x5800b
+80000008:	cc002573          	csrr	a0,0xcc0
+8000000c:	a5a507b7          	lui	a5,0xa5a50
+80000010:	00a7e7b3          	or	a5,a5,a0
+80000014:	8001f637          	lui	a2,0x8001f
+80000018:	00251693          	sll	a3,a0,0x2
+8000001c:	00d60633          	add	a2,a2,a3
+80000020:	00f62023          	sw	a5,0(a2) # 8001f000 <_start+0x1f000>
+80000024:	0ff0000f          	fence
+80000028:	0000000b          	.4byte	0xb
+8000002c:	0000006f          	j	8000002c <_start+0x2c>

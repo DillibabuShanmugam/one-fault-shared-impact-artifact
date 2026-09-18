@@ -1,0 +1,11 @@
+pairs_per_col,total_pairs,num_candidates,correct_found,unique_recovery,mean_solve_ms,std_solve_ms,min_solve_ms,max_solve_ms
+1,4,10000,False,False,28.59,1.19,26.76,31.97
+2,8,1,True,True,35.01,2.81,34.22,49.82
+3,12,1,True,True,52.6,2.55,51.36,65.72
+4,16,1,True,True,70.72,1.99,69.65,80.98
+5,20,1,True,True,88.84,1.48,87.44,93.91
+8,32,1,True,True,142.88,1.71,140.75,148.41
+10,40,1,True,True,181.81,2.76,179.11,189.84
+15,60,1,True,True,276.84,4.27,271.57,290.29
+20,80,1,True,True,387.27,32.93,368.6,490.3
+25,100,1,True,True,511.45,53.2,461.14,600.69

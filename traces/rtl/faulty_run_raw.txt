@@ -1,0 +1,12 @@
+Running rtl_amplification_2026-07-13/kernel/amp_kernel.bin...
+CONFIGS: num_threads=4, num_warps=4, num_cores=1, num_clusters=1, socket_size=1, local_mem_base=0xffff0000, num_barriers=2
+[FI] pass  wid=0 instr=0 rd=11 tmask=0001 data= [0]=0x0000000f [1]=0x0000000f [2]=0x0000000f [3]=0x0000000f
+[FI] pass  wid=0 instr=1 rd=10 tmask=1111 data= [0]=0x00000000 [1]=0x00000001 [2]=0x00000002 [3]=0x00000003
+[FI] pass  wid=0 instr=2 rd=15 tmask=1111 data= [0]=0xa5a50000 [1]=0xa5a50000 [2]=0xa5a50000 [3]=0xa5a50000
+[FI] INJECT wid=0 instr=3 rd=15 tmask=1111 mask=0x000000ff
+[FI]   lane 0 ACTIVE  0xa5a50000 -> 0xa5a500ff
+[FI]   lane 1 ACTIVE  0xa5a50001 -> 0xa5a500fe
+[FI]   lane 2 ACTIVE  0xa5a50002 -> 0xa5a500fd
+[FI]   lane 3 ACTIVE  0xa5a50003 -> 0xa5a500fc
+[RESULT] lane0=0xa5a500ff lane1=0xa5a500fe lane2=0xa5a500fd lane3=0xa5a500fc 
+faulty exit=13
